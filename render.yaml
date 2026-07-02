@@ -1,0 +1,22 @@
+# Render Blueprint. In Render: New → Blueprint → point at this repo.
+# Render reads this file and provisions the service. Fill in the env var values
+# in the dashboard (they are marked sync:false so they are never committed).
+services:
+  - type: web
+    name: ai-pr-reviewer
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /
+    envVars:
+      - key: APP_ID
+        sync: false
+      - key: PRIVATE_KEY
+        sync: false
+      - key: WEBHOOK_SECRET
+        sync: false
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: OPENROUTER_MODEL
+        value: anthropic/claude-sonnet-4
