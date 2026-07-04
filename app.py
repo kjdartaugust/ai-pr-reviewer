@@ -52,6 +52,29 @@ CODE_EXTENSIONS = {
     ".sh", ".sql", ".vue", ".svelte", ".lua", ".dart", ".r", ".ex", ".exs",
 }
 
+# Directory names that hold generated/vendored code, not source worth reviewing.
+# A file is skipped if any of its path segments matches one of these.
+IGNORE_DIRS = {
+    "node_modules", "vendor", "dist", "build", "out", "target", "bin", "obj",
+    ".next", ".nuxt", ".svelte-kit", ".output", ".vercel", ".netlify",
+    "__pycache__", ".venv", "venv", "env", ".git", ".cache", "coverage",
+    ".pytest_cache", ".mypy_cache", ".gradle", ".idea", "migrations",
+}
+
+
+def _is_reviewable(path: str) -> bool:
+    """True if a repo file looks like hand-written source worth reviewing."""
+    if os.path.splitext(path)[1].lower() not in CODE_EXTENSIONS:
+        return False
+    segments = path.replace("\\", "/").split("/")
+    # Skip anything inside an ignored dir, a hidden/backup dir, or a minified file.
+    if any(seg in IGNORE_DIRS or seg.startswith(".") for seg in segments[:-1]):
+        return False
+    name = segments[-1]
+    if name.endswith((".min.js", ".min.css", ".bundle.js", ".map")):
+        return False
+    return True
+
 # Shared instruction on what to report, appended to each review's system prompt.
 _REVIEW_RUBRIC = (
     "Begin with a one-line **Verdict:** stating the overall outcome and a count "
@@ -252,8 +275,7 @@ async def fetch_repo_snapshot(
     blobs = [
         item
         for item in tree_resp.json().get("tree", [])
-        if item.get("type") == "blob"
-        and os.path.splitext(item["path"])[1].lower() in CODE_EXTENSIONS
+        if item.get("type") == "blob" and _is_reviewable(item["path"])
     ]
 
     parts: list[str] = []
