@@ -86,6 +86,30 @@ var values when prompted. To set it up manually instead:
 Open, reopen, or push to a PR in an installed repo — the AI review appears as a
 comment within a few seconds.
 
+## General review endpoints
+
+Besides the PR webhook, the service exposes three on-demand review endpoints
+that reuse the same OpenRouter logic. They return JSON (`{"review": "..."}`)
+rather than posting a comment.
+
+| Endpoint | Body | What it reviews |
+| -------- | ---- | --------------- |
+| `POST /review/code` | `{"code": "...", "language": "python", "filename": "x.py"}` | A raw code snippet (`language`/`filename` optional) |
+| `POST /review/commit` | `{"repo": "owner/name", "sha": "<commit-sha>"}` | The diff of a single commit |
+| `POST /review/repo` | `{"repo": "owner/name", "branch": "main"}` | A snapshot of the repo's source (`branch` optional) |
+
+```bash
+curl -X POST https://<your-service>.onrender.com/review/code \
+  -H 'Content-Type: application/json' \
+  -d '{"code":"def div(a,b):\n    return a/b","language":"python"}'
+```
+
+For `commit` and `repo`, the service uses a GitHub App installation token when
+the App is installed on the target repo (needed for private repos); otherwise it
+falls back to unauthenticated access, which works for public repos. The repo
+scan concatenates source files up to ~60k characters, so very large repos are
+sampled rather than read in full.
+
 ## Local development
 
 ```bash

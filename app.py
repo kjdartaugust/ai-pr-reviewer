@@ -17,6 +17,7 @@ import httpx
 import jwt
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Request
+from pydantic import BaseModel
 
 load_dotenv()
 
@@ -36,18 +37,48 @@ OPENROUTER_API = "https://openrouter.ai/api/v1/chat/completions"
 # Events that should trigger a review.
 REVIEW_ACTIONS = {"opened", "reopened", "synchronize", "ready_for_review"}
 
-# Cap the diff we send to the model to keep token usage sane.
-MAX_DIFF_CHARS = 60_000
+# Cap the content we send to the model to keep token usage sane.
+MAX_DIFF_CHARS = 60_000       # per-diff budget (PR + commit reviews)
+MAX_CODE_CHARS = 60_000       # per-snippet budget (paste-code reviews)
+MAX_REPO_CHARS = 60_000       # total budget for a full-repo scan
+MAX_FILE_CHARS = 12_000       # per-file cap within a repo scan
 
-SYSTEM_PROMPT = (
-    "You are a senior software engineer performing a code review on a GitHub "
-    "pull request. Review the unified diff below and report:\n"
+# Source-file extensions worth including in a full-repo scan.
+CODE_EXTENSIONS = {
+    ".py", ".js", ".jsx", ".ts", ".tsx", ".go", ".rs", ".java", ".rb", ".php",
+    ".c", ".h", ".cc", ".cpp", ".hpp", ".cs", ".swift", ".kt", ".scala", ".m",
+    ".sh", ".sql", ".vue", ".svelte", ".lua", ".dart", ".r", ".ex", ".exs",
+}
+
+# Shared instruction on what to report, appended to each review's system prompt.
+_REVIEW_RUBRIC = (
+    "Report:\n"
     "1. Bugs or correctness issues\n"
     "2. Security vulnerabilities\n"
     "3. Concrete improvement suggestions\n\n"
     "Be specific and reference file names and line context where possible. "
-    "Use concise Markdown with headings. If the diff looks clean, say so "
-    "briefly instead of inventing problems."
+    "Use concise Markdown with headings. If it looks clean, say so briefly "
+    "instead of inventing problems."
+)
+
+# For unified diffs (pull requests and single commits).
+SYSTEM_PROMPT = (
+    "You are a senior software engineer performing a code review. Review the "
+    "unified diff below. " + _REVIEW_RUBRIC
+)
+
+# For a raw code snippet or single file pasted by the user.
+CODE_SYSTEM_PROMPT = (
+    "You are a senior software engineer reviewing a snippet of code. Review "
+    "the code below. " + _REVIEW_RUBRIC
+)
+
+# For a concatenated snapshot of many files across a repository.
+REPO_SYSTEM_PROMPT = (
+    "You are a senior software engineer performing a review of an entire "
+    "repository. Below is a snapshot of its source files, each prefixed with "
+    "its path. Give an overall assessment plus the most important findings. "
+    + _REVIEW_RUBRIC
 )
 
 app = FastAPI(title="AI PR Reviewer")
@@ -121,11 +152,123 @@ async def fetch_diff(
     return resp.text
 
 
-async def review_diff(client: httpx.AsyncClient, diff: str) -> str:
-    """Send the diff to OpenRouter and return the review text."""
-    if len(diff) > MAX_DIFF_CHARS:
-        diff = diff[:MAX_DIFF_CHARS] + "\n\n... [diff truncated] ..."
+async def get_installation_token_for_repo(
+    client: httpx.AsyncClient, repo: str
+) -> str | None:
+    """Return an installation token for `repo` if the App is installed there.
 
+    Returns None (rather than raising) when the App has no installation on the
+    repo or the App credentials are unset — callers fall back to unauthenticated
+    requests, which work for public repositories.
+    """
+    if not APP_ID or not PRIVATE_KEY:
+        return None
+    try:
+        resp = await client.get(
+            f"{GITHUB_API}/repos/{repo}/installation",
+            headers={
+                "Authorization": f"Bearer {create_app_jwt()}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+        )
+        resp.raise_for_status()
+    except httpx.HTTPStatusError:
+        return None
+    return await get_installation_token(client, resp.json()["id"])
+
+
+async def fetch_commit_diff(
+    client: httpx.AsyncClient, token: str | None, repo: str, sha: str
+) -> str:
+    """Fetch the unified diff for a single commit."""
+    headers = {
+        "Accept": "application/vnd.github.v3.diff",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    resp = await client.get(
+        f"{GITHUB_API}/repos/{repo}/commits/{sha}", headers=headers
+    )
+    resp.raise_for_status()
+    return resp.text
+
+
+async def fetch_file_content(
+    client: httpx.AsyncClient, token: str | None, repo: str, ref: str, path: str
+) -> str | None:
+    """Fetch a single file's raw text, or None if it can't be read as text."""
+    headers = {
+        "Accept": "application/vnd.github.v3.raw",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    resp = await client.get(
+        f"{GITHUB_API}/repos/{repo}/contents/{path}",
+        params={"ref": ref},
+        headers=headers,
+    )
+    if resp.status_code != 200:
+        return None
+    return resp.text
+
+
+async def fetch_repo_snapshot(
+    client: httpx.AsyncClient, token: str | None, repo: str, branch: str | None
+) -> tuple[str, list[str], str]:
+    """Concatenate a repo's source files into one snapshot (within budget).
+
+    Returns (snapshot_text, included_paths, branch). Files are added in tree
+    order until MAX_REPO_CHARS is reached; each file is capped at MAX_FILE_CHARS.
+    """
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    if not branch:
+        info = await client.get(f"{GITHUB_API}/repos/{repo}", headers=headers)
+        info.raise_for_status()
+        branch = info.json()["default_branch"]
+
+    tree_resp = await client.get(
+        f"{GITHUB_API}/repos/{repo}/git/trees/{branch}",
+        params={"recursive": "1"},
+        headers=headers,
+    )
+    tree_resp.raise_for_status()
+    blobs = [
+        item
+        for item in tree_resp.json().get("tree", [])
+        if item.get("type") == "blob"
+        and os.path.splitext(item["path"])[1].lower() in CODE_EXTENSIONS
+    ]
+
+    parts: list[str] = []
+    included: list[str] = []
+    total = 0
+    for item in blobs:
+        if total >= MAX_REPO_CHARS:
+            break
+        content = await fetch_file_content(client, token, repo, branch, item["path"])
+        if content is None:
+            continue
+        block = f"--- {item['path']} ---\n{content[:MAX_FILE_CHARS]}\n"
+        parts.append(block)
+        included.append(item["path"])
+        total += len(block)
+
+    return "\n".join(parts), included, branch
+
+
+async def call_openrouter(
+    client: httpx.AsyncClient, system_prompt: str, user_content: str
+) -> str:
+    """Send a system+user message pair to OpenRouter and return the reply."""
     resp = await client.post(
         OPENROUTER_API,
         headers={
@@ -135,8 +278,8 @@ async def review_diff(client: httpx.AsyncClient, diff: str) -> str:
         json={
             "model": OPENROUTER_MODEL,
             "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": f"```diff\n{diff}\n```"},
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
             ],
         },
         timeout=120,
@@ -144,6 +287,13 @@ async def review_diff(client: httpx.AsyncClient, diff: str) -> str:
     resp.raise_for_status()
     data = resp.json()
     return data["choices"][0]["message"]["content"]
+
+
+async def review_diff(client: httpx.AsyncClient, diff: str) -> str:
+    """Send a unified diff to OpenRouter and return the review text."""
+    if len(diff) > MAX_DIFF_CHARS:
+        diff = diff[:MAX_DIFF_CHARS] + "\n\n... [diff truncated] ..."
+    return await call_openrouter(client, SYSTEM_PROMPT, f"```diff\n{diff}\n```")
 
 
 async def post_comment(
@@ -234,3 +384,124 @@ async def webhook(
             raise HTTPException(status_code=502, detail="Failed to post comment")
 
     return {"msg": "review posted", "repo": repo, "pr": number}
+
+
+# --- General code-review endpoints (no webhook / PR required) ----------------
+
+
+def _require_openrouter() -> None:
+    if not OPENROUTER_API_KEY:
+        raise HTTPException(status_code=500, detail="OPENROUTER_API_KEY must be set")
+
+
+class CodeReviewRequest(BaseModel):
+    code: str
+    language: str | None = None
+    filename: str | None = None
+
+
+class CommitReviewRequest(BaseModel):
+    repo: str  # "owner/name"
+    sha: str
+
+
+class RepoScanRequest(BaseModel):
+    repo: str  # "owner/name"
+    branch: str | None = None  # defaults to the repo's default branch
+
+
+@app.post("/review/code")
+async def review_code(req: CodeReviewRequest) -> dict:
+    """Review a raw code snippet pasted in the request body."""
+    _require_openrouter()
+    if not req.code.strip():
+        raise HTTPException(status_code=400, detail="No code provided")
+
+    code = req.code
+    if len(code) > MAX_CODE_CHARS:
+        code = code[:MAX_CODE_CHARS] + "\n\n... [code truncated] ..."
+
+    label = req.filename or "snippet"
+    fence = req.language or ""
+    user_content = f"File: {label}\n\n```{fence}\n{code}\n```"
+
+    async with httpx.AsyncClient() as client:
+        try:
+            review = await call_openrouter(client, CODE_SYSTEM_PROMPT, user_content)
+        except httpx.HTTPStatusError as exc:
+            logger.error("OpenRouter error: %s - %s", exc, exc.response.text)
+            raise HTTPException(status_code=502, detail="Review generation failed")
+
+    return {"review": review, "model": OPENROUTER_MODEL}
+
+
+@app.post("/review/commit")
+async def review_commit(req: CommitReviewRequest) -> dict:
+    """Review the changes introduced by a single commit."""
+    _require_openrouter()
+
+    async with httpx.AsyncClient() as client:
+        token = await get_installation_token_for_repo(client, req.repo)
+        try:
+            diff = await fetch_commit_diff(client, token, req.repo, req.sha)
+        except httpx.HTTPStatusError as exc:
+            status = 404 if exc.response.status_code == 404 else 502
+            detail = (
+                "Commit or repo not found (or the App isn't installed on a "
+                "private repo)"
+                if status == 404
+                else "Failed to fetch commit diff"
+            )
+            logger.error("Failed to fetch commit diff: %s", exc)
+            raise HTTPException(status_code=status, detail=detail)
+
+        if not diff.strip():
+            return {"msg": "empty diff, nothing to review"}
+
+        try:
+            review = await review_diff(client, diff)
+        except httpx.HTTPStatusError as exc:
+            logger.error("OpenRouter error: %s - %s", exc, exc.response.text)
+            raise HTTPException(status_code=502, detail="Review generation failed")
+
+    return {"review": review, "repo": req.repo, "sha": req.sha, "model": OPENROUTER_MODEL}
+
+
+@app.post("/review/repo")
+async def review_repo(req: RepoScanRequest) -> dict:
+    """Scan and review an entire repository's source (within a size budget)."""
+    _require_openrouter()
+
+    async with httpx.AsyncClient() as client:
+        token = await get_installation_token_for_repo(client, req.repo)
+        try:
+            snapshot, files, branch = await fetch_repo_snapshot(
+                client, token, req.repo, req.branch
+            )
+        except httpx.HTTPStatusError as exc:
+            status = 404 if exc.response.status_code == 404 else 502
+            detail = (
+                "Repo or branch not found (or the App isn't installed on a "
+                "private repo)"
+                if status == 404
+                else "Failed to read repository"
+            )
+            logger.error("Failed to read repo: %s", exc)
+            raise HTTPException(status_code=status, detail=detail)
+
+        if not snapshot.strip():
+            return {"msg": "no reviewable source files found", "branch": branch}
+
+        try:
+            review = await call_openrouter(client, REPO_SYSTEM_PROMPT, snapshot)
+        except httpx.HTTPStatusError as exc:
+            logger.error("OpenRouter error: %s - %s", exc, exc.response.text)
+            raise HTTPException(status_code=502, detail="Review generation failed")
+
+    return {
+        "review": review,
+        "repo": req.repo,
+        "branch": branch,
+        "files_reviewed": files,
+        "model": OPENROUTER_MODEL,
+    }
