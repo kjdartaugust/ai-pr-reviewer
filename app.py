@@ -54,13 +54,19 @@ CODE_EXTENSIONS = {
 
 # Shared instruction on what to report, appended to each review's system prompt.
 _REVIEW_RUBRIC = (
-    "Report:\n"
+    "Begin with a one-line **Verdict:** stating the overall outcome and a count "
+    "of issues by severity (e.g. `Verdict: 1 Critical, 2 High, 1 Low — needs "
+    "changes`). Then report findings grouped as:\n"
     "1. Bugs or correctness issues\n"
     "2. Security vulnerabilities\n"
-    "3. Concrete improvement suggestions\n\n"
-    "Be specific and reference file names and line context where possible. "
-    "Use concise Markdown with headings. If it looks clean, say so briefly "
-    "instead of inventing problems."
+    "3. Improvement suggestions\n\n"
+    "Tag every finding with a severity label — **[Critical]**, **[High]**, "
+    "**[Medium]**, or **[Low]** — and order findings from most to least severe. "
+    "Prioritize issues that genuinely matter (correctness, security, data loss); "
+    "do not pad the review with trivial style nitpicks. Be specific and reference "
+    "file names and line context where possible. Use concise Markdown with "
+    "headings. If the code is clean, say so in the Verdict and keep the rest "
+    "brief instead of inventing problems."
 )
 
 # For unified diffs (pull requests and single commits).
