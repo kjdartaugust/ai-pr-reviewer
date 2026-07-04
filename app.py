@@ -11,12 +11,14 @@ import hashlib
 import hmac
 import logging
 import os
+import pathlib
 import time
 
 import httpx
 import jwt
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 load_dotenv()
@@ -315,6 +317,18 @@ async def post_comment(
 @app.get("/")
 async def health() -> dict:
     return {"status": "ok", "service": "ai-pr-reviewer"}
+
+
+_UI_PATH = pathlib.Path(__file__).parent / "static" / "index.html"
+
+
+@app.get("/app", response_class=HTMLResponse)
+async def ui() -> str:
+    """Serve the paste-code web UI."""
+    try:
+        return _UI_PATH.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="UI not found")
 
 
 @app.post("/webhook")
