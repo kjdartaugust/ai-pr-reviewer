@@ -46,10 +46,26 @@
     padding: 16px;
     margin-bottom: 16px;
   }
+  .tabs { display: flex; gap: 6px; margin-bottom: 16px; }
+  .tab {
+    flex: 1;
+    padding: 10px;
+    text-align: center;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--card);
+    color: var(--muted);
+    font-size: 0.9rem;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .tab.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .panel { display: none; }
+  .panel.active { display: block; }
   label { display: block; font-size: 0.8rem; color: var(--muted); margin-bottom: 6px; font-weight: 600; }
   textarea {
     width: 100%;
-    min-height: 220px;
+    min-height: 200px;
     resize: vertical;
     font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     font-size: 0.9rem;
@@ -61,7 +77,8 @@
   }
   .row { display: flex; gap: 10px; margin-top: 12px; flex-wrap: wrap; }
   .row > div { flex: 1; min-width: 140px; }
-  input, select {
+  .field { margin-top: 12px; }
+  input {
     width: 100%;
     padding: 10px;
     border: 1px solid var(--border);
@@ -70,7 +87,7 @@
     color: var(--text);
     font-size: 0.9rem;
   }
-  button {
+  button.go {
     margin-top: 14px;
     width: 100%;
     padding: 13px;
@@ -82,17 +99,13 @@
     font-weight: 600;
     cursor: pointer;
   }
-  button:hover:not(:disabled) { background: var(--accent-hover); }
-  button:disabled { opacity: 0.6; cursor: default; }
+  button.go:hover:not(:disabled) { background: var(--accent-hover); }
+  button.go:disabled { opacity: 0.6; cursor: default; }
+  .hint { font-size: 0.78rem; color: var(--muted); margin-top: 6px; }
   #out { display: none; }
   #out.show { display: block; }
   .out-body { overflow-x: auto; }
-  .out-body pre {
-    background: var(--code-bg);
-    padding: 12px;
-    border-radius: 8px;
-    overflow-x: auto;
-  }
+  .out-body pre { background: var(--code-bg); padding: 12px; border-radius: 8px; overflow-x: auto; }
   .out-body code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.88rem; }
   .out-body :not(pre) > code { background: var(--code-bg); padding: 2px 5px; border-radius: 5px; }
   .out-body h1, .out-body h2, .out-body h3 { margin-top: 1.2em; }
@@ -110,23 +123,60 @@
 <div class="wrap">
   <header>
     <h1>🤖 AI Code Review</h1>
-    <p class="sub">Paste your code, get an instant review — bugs, security, and improvements.</p>
+    <p class="sub">Review pasted code, a commit, or a whole repo — bugs, security, improvements.</p>
   </header>
 
+  <div class="tabs">
+    <div class="tab active" data-tab="code">Paste code</div>
+    <div class="tab" data-tab="commit">Commit</div>
+    <div class="tab" data-tab="repo">Repo</div>
+  </div>
+
   <div class="card">
-    <label for="code">Your code</label>
-    <textarea id="code" placeholder="Paste code here..." spellcheck="false"></textarea>
-    <div class="row">
-      <div>
-        <label for="language">Language (optional)</label>
-        <input id="language" placeholder="e.g. python" />
+    <!-- Paste code -->
+    <div class="panel active" id="panel-code">
+      <label for="code">Your code</label>
+      <textarea id="code" placeholder="Paste code here..." spellcheck="false"></textarea>
+      <div class="row">
+        <div>
+          <label for="language">Language (optional)</label>
+          <input id="language" placeholder="e.g. python" />
+        </div>
+        <div>
+          <label for="filename">Filename (optional)</label>
+          <input id="filename" placeholder="e.g. app.py" />
+        </div>
       </div>
-      <div>
-        <label for="filename">Filename (optional)</label>
-        <input id="filename" placeholder="e.g. app.py" />
-      </div>
+      <button class="go" data-kind="code">Review my code</button>
     </div>
-    <button id="go">Review my code</button>
+
+    <!-- Commit -->
+    <div class="panel" id="panel-commit">
+      <div class="field">
+        <label for="commit-repo">Repository</label>
+        <input id="commit-repo" placeholder="owner/name  e.g. kjdartaugust/dynamic-recipe-app" />
+      </div>
+      <div class="field">
+        <label for="commit-sha">Commit SHA</label>
+        <input id="commit-sha" placeholder="e.g. 8cec023  (or full hash)" />
+      </div>
+      <p class="hint">Reviews the changes in one commit. Public repos work as-is; private repos need the GitHub App installed.</p>
+      <button class="go" data-kind="commit">Review commit</button>
+    </div>
+
+    <!-- Repo -->
+    <div class="panel" id="panel-repo">
+      <div class="field">
+        <label for="repo-repo">Repository</label>
+        <input id="repo-repo" placeholder="owner/name  e.g. kjdartaugust/dynamic-recipe-app" />
+      </div>
+      <div class="field">
+        <label for="repo-branch">Branch (optional)</label>
+        <input id="repo-branch" placeholder="defaults to the main branch" />
+      </div>
+      <p class="hint">Scans the repo's source files (up to ~60k characters). Large repos are sampled.</p>
+      <button class="go" data-kind="repo">Scan repo</button>
+    </div>
   </div>
 
   <div class="card" id="out">
@@ -137,13 +187,21 @@
 
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 <script>
-  const btn = document.getElementById('go');
   const out = document.getElementById('out');
   const body = document.getElementById('body');
   const meta = document.getElementById('meta');
 
+  // Tab switching
+  document.querySelectorAll('.tab').forEach(tab => {
+    tab.addEventListener('click', () => {
+      document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+      document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+      tab.classList.add('active');
+      document.getElementById('panel-' + tab.dataset.tab).classList.add('active');
+    });
+  });
+
   function render(text) {
-    // marked may fail to load if the CDN is blocked; fall back to plain text.
     if (window.marked) {
       body.innerHTML = marked.parse(text);
     } else {
@@ -152,10 +210,32 @@
     }
   }
 
-  async function review() {
-    const code = document.getElementById('code').value.trim();
-    if (!code) { alert('Paste some code first.'); return; }
+  const val = id => document.getElementById(id).value.trim();
 
+  // Build the request for each tab; return null with an alert if invalid.
+  function buildRequest(kind) {
+    if (kind === 'code') {
+      const code = val('code');
+      if (!code) { alert('Paste some code first.'); return null; }
+      return { url: '/review/code', payload: { code, language: val('language') || null, filename: val('filename') || null } };
+    }
+    if (kind === 'commit') {
+      const repo = val('commit-repo'), sha = val('commit-sha');
+      if (!repo || !sha) { alert('Enter both a repository and a commit SHA.'); return null; }
+      return { url: '/review/commit', payload: { repo, sha } };
+    }
+    if (kind === 'repo') {
+      const repo = val('repo-repo');
+      if (!repo) { alert('Enter a repository (owner/name).'); return null; }
+      return { url: '/review/repo', payload: { repo, branch: val('repo-branch') || null } };
+    }
+  }
+
+  async function run(kind, btn) {
+    const req = buildRequest(kind);
+    if (!req) return;
+
+    const original = btn.textContent;
     btn.disabled = true;
     btn.innerHTML = '<span class="spinner"></span>Reviewing...';
     out.classList.add('show');
@@ -163,31 +243,33 @@
     meta.textContent = '';
 
     try {
-      const resp = await fetch('/review/code', {
+      const resp = await fetch(req.url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          code,
-          language: document.getElementById('language').value.trim() || null,
-          filename: document.getElementById('filename').value.trim() || null,
-        }),
+        body: JSON.stringify(req.payload),
       });
       const data = await resp.json();
       if (!resp.ok) {
         body.innerHTML = '<p class="error">Error: ' + (data.detail || resp.status) + '</p>';
-      } else {
+      } else if (data.review) {
         render(data.review);
-        meta.textContent = 'Reviewed by ' + data.model;
+        let m = 'Reviewed by ' + data.model;
+        if (data.files_reviewed) m += ' · ' + data.files_reviewed.length + ' files';
+        meta.textContent = m;
+      } else {
+        body.innerHTML = '<p class="sub">' + (data.msg || 'Nothing to review.') + '</p>';
       }
     } catch (e) {
       body.innerHTML = '<p class="error">Network error: ' + e.message + '</p>';
     } finally {
       btn.disabled = false;
-      btn.textContent = 'Review my code';
+      btn.textContent = original;
     }
   }
 
-  btn.addEventListener('click', review);
+  document.querySelectorAll('button.go').forEach(btn => {
+    btn.addEventListener('click', () => run(btn.dataset.kind, btn));
+  });
 </script>
 </body>
 </html>
